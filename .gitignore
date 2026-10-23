@@ -1,0 +1,22 @@
+# Binaries and packaging
+dist/
+bin/
+*.deb
+
+# Temp & Runtime files
+*.tmp
+*.tmp.*
+*.sock
+*.log
+
+# Sensitive credentials & certificates
+*.key
+*.pem
+*.crt
+*.cert
+*.p12
+*.pfx
+
+# Local state & config
+config.json
+state.json

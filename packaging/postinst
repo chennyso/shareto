@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+# Container check: detect Docker / Podman / LXC / chroot
+is_container() {
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+        return 0
+    fi
+    if [ -r /proc/1/cgroup ] && grep -Eq '(docker|lxc|kubepods)' /proc/1/cgroup; then
+        return 0
+    fi
+    return 1
+}
+
+if is_container; then
+    echo "[shareto] Detected containerized environment. Systemd user services might not run automatically."
+    echo "[shareto] You can start shareto daemon manually via: shareto daemon"
+else
+    echo "================================================================================"
+    echo " shareto installed successfully!"
+    echo "================================================================================"
+    echo " To enable and start the shareto background daemon for your user account:"
+    echo "   systemctl --user daemon-reload"
+    echo "   systemctl --user enable --now shareto.service"
+    echo ""
+    echo " To keep the daemon running after SSH logout, enable lingering:"
+    echo "   sudo loginctl enable-linger \$USER"
+    echo "================================================================================"
+fi
+
+exit 0

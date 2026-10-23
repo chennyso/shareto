@@ -1,0 +1,19 @@
+[Unit]
+Description=shareto - Safe and minimal large file distribution daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/shareto daemon
+Restart=on-failure
+RestartSec=3s
+
+# Kernel Hardening & Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/shareto %h/.config/shareto %t/shareto
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
