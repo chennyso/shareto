@@ -84,15 +84,28 @@ make build
 ```
 编译产物位于 `dist/shareto`。
 
-### 2. 构建与安装 Debian 软件包 (.deb)
+### 2. 多 Linux 发行版打包与安装 (.deb / .rpm / .tar.gz)
+
+本项目内置 `nfpm` 打包工作流，一条命令自动编译并构建覆盖全 Linux 发行版的安装包：
 
 ```bash
-# 生成 deb 包
-make deb
-
-# 安装至系统
-sudo dpkg -i dist/shareto_3.0.0_amd64.deb
+# 一键生成全平台打包文件 (.deb, .rpm, .tar.gz)
+make package
 ```
+产物说明与安装命令：
+- **Debian / Ubuntu** (`.deb`)：
+  ```bash
+  sudo dpkg -i dist/shareto_3.0.0_amd64.deb
+  ```
+- **RHEL / CentOS / Rocky / Fedora / openSUSE** (`.rpm`)：
+  ```bash
+  sudo rpm -Uvh dist/shareto-3.0.0-1.x86_64.rpm
+  ```
+- **通用便携包** (`.tar.gz`，适用于 Arch、Alpine 及任意 Linux 发行版)：
+  ```bash
+  tar -xzf dist/shareto_3.0.0_linux_amd64.tar.gz
+  sudo cp shareto/shareto /usr/local/bin/
+  ```
 
 安装后启用 Systemd 用户后台守护进程：
 ```bash
@@ -107,7 +120,30 @@ sudo loginctl enable-linger $USER
 
 ## 💻 CLI 命令与使用示例
 
-### 1. 创建文件分享 (默认命令)
+### 1. 运行交互式配置向导 (`shareto init`)
+
+首次安装后，**强烈建议先运行 `shareto init`**。向导会自动探测本机公网 IPv6/局域网 IP 与端口可用性，并引导配置 HTTPS 证书：
+
+```bash
+shareto init
+```
+流程示例：
+```text
+1. Listen address and port (e.g. [::]:38080) [[::]:38080]: [::]:38080
+   ✓ Port check passed for [::]:38080
+
+2. Enable native HTTPS / TLS encryption? (y/N) [y]: y
+   Certificate fullchain path (.crt/.pem): ~/.config/ssl/share.example.com.crt
+   Private key path (.key/.pem): ~/.config/ssl/share.example.com.key
+   ✓ Valid certificate loaded! CommonName: share.example.com, Expires: 2027-01-20
+
+3. Public Base URL [https://share.example.com:38080]: https://share.example.com:38080
+
+[✓] Configuration successfully saved to ~/.config/shareto/config.json
+[✓] shareto.service restarted successfully!
+```
+
+### 2. 创建文件分享 (默认命令)
 
 ```bash
 # 快速分享文件（默认有效期 24h，最大下载次数 10）
@@ -119,13 +155,13 @@ shareto -t 3d -m 5 /path/to/backup.tar.gz
 # 启用密码保护（终端交互式无回显输入）
 shareto -p /path/to/confidential.zip
 
-# 临时指定对外访问的基础 URL（覆盖配置中的 public_base_url）
-shareto --base-url https://share.example.com:38080 /path/to/file.iso
-
 # 管道输入密码或环境变量免交互
 echo "my_secret_pass" | shareto --password-stdin /path/to/data.bin
 # 或
 SHARETO_PASSWORD="my_password" shareto -p /path/to/data.bin
+
+# 临时覆盖基础 URL（适用于临时使用特定外网域名或 IP）
+shareto --base-url https://share.example.com:38080 /path/to/file.iso
 ```
 
 终端将输出公共访问链接：
@@ -140,7 +176,7 @@ File successfully shared!
 
 > **终端直链下载模式**：若分享未设置密码，使用 `curl -L -OJ "<Public_URL>?raw=1"` 可直接重定向至流传输分片下载。
 
-### 2. 查看当前分享列表
+### 3. 查看当前分享列表
 
 ```bash
 shareto list
@@ -152,7 +188,7 @@ m3l2Z4s8..  archive.iso      4.28 GB    3/10       2        None      2026-10-23
 a90Kf21x..  backup.tar.gz    512.00 MB  1/5        0        Password  2026-10-24T12:00:00Z
 ```
 
-### 3. 吊销指定分享
+### 4. 吊销指定分享
 
 支持传入 Token 全称、前 6 位以上前缀、或原始物理文件路径：
 ```bash
@@ -161,7 +197,7 @@ shareto revoke m3l2Z4s8
 shareto revoke /path/to/archive.iso
 ```
 
-### 4. 查看守护进程状态
+### 5. 查看守护进程状态
 
 ```bash
 shareto status
@@ -169,7 +205,7 @@ shareto status
 
 ---
 
-## ⚙️ 配置文件说明
+## ⚙️ 配置文件与公网 HTTPS 说明
 
 首次启动时，程序会在 `$XDG_CONFIG_HOME/shareto/config.json`（默认为 `~/.config/shareto/config.json`）自动生成默认配置：
 
@@ -196,15 +232,55 @@ shareto status
 
 | 字段 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
-| `listen_addr` | `127.0.0.1:38080` | HTTP 内部监听地址 |
-| `public_base_url` | `http://127.0.0.1:38080` | 生成公共分享链接时使用的前缀（配置公网域名/反向代理时需修改） |
+| `listen_addr` | `127.0.0.1:38080` | HTTP/HTTPS 监听地址（若直连外网需改为 `[::]:38080` 或 `0.0.0.0:38080`） |
+| `public_base_url` | `http://127.0.0.1:38080` | 生成公共分享链接时使用的前缀（配置公网域名/HTTPS 时修改此处） |
+| `tls.enabled` | `false` | 是否开启内置 TLS 加密（直连模式下推荐开启） |
+| `tls.cert_file` | `""` | 证书路径（支持绝对路径或 `~/...` 用户目录路径） |
+| `tls.key_file` | `""` | 私钥路径（支持绝对路径或 `~/...` 用户目录路径） |
 | `trusted_proxies` | `["127.0.0.1/32", "::1/128"]` | 可信反向代理 CIDR 列表（仅受信任代理来源允许解析 `X-Forwarded-For`） |
 | `max_global_streams` | `64` | 全局允许的最大活跃下载并发连接流 |
 | `max_streams_per_token` | `16` | 单个分享链接允许的最大下载并发连接流 |
 | `max_streams_per_session` | `8` | 单个会话允许的最大并发连接流（多线程分片下载） |
 | `min_transfer_rate_kbps`| `16` | 最低传输速率阈值（KB/s），低于该速率超 15s 强制掐断 |
 
-> **反向代理建议**：配合 Nginx、Caddy 或 Tailscale Serve 作为前端网关，开启 HTTPS 终结并将流量反向代理至 `listen_addr` 即可。
+### 域名与 HTTPS 证书配置实战
+
+#### 模式 A：原生内置 HTTPS 直连（推荐公网直连或动态 IPv6）
+
+若你的机器拥有公网 IPv6 或公网 IP，直接使用内置 TLS 即可无需安装额外 Web 服务器：
+
+1. **申请证书**：家庭宽带 80/443 被封时，推荐使用 `acme.sh` 通过 DNS-01 API 验证免费申请 Let's Encrypt 证书并安装到本地（例如 `~/.config/ssl/`）。
+2. **修改配置**：
+   ```json
+   {
+     "listen_addr": "[::]:38080",
+     "public_base_url": "https://share.example.com:38080",
+     "tls": {
+       "enabled": true,
+       "cert_file": "~/.config/ssl/share.example.com.crt",
+       "key_file": "~/.config/ssl/share.example.com.key"
+     }
+   }
+   ```
+3. **重启守护进程**：`systemctl --user restart shareto.service`。
+
+> 💡 **提示**：程序原生支持 `~` 自动展开为当前用户目录（如 `/home/user`）。
+
+#### 模式 B：Nginx / Caddy 反向代理模式
+
+若服务器已有 Nginx / Caddy 集中处理证书与 443 端口：
+1. `shareto` 配置保持 `listen_addr: "127.0.0.1:38080"`，`tls.enabled: false`，`public_base_url: "https://share.example.com"`。
+2. Nginx 配置核心指令：**必须关闭缓冲以支持大文件直通流传输**：
+   ```nginx
+   location / {
+       proxy_pass http://127.0.0.1:38080;
+       proxy_buffering off;
+       proxy_read_timeout 3600s;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto https;
+   }
+   ```
 
 ---
 

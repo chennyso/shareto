@@ -37,6 +37,8 @@ func main() {
 	firstArg := os.Args[1]
 
 	switch firstArg {
+	case "init":
+		runInit()
 	case "daemon":
 		runDaemon()
 	case "list":
@@ -60,6 +62,7 @@ func printUsage() {
 
 Usage:
   shareto [flags] <file_path>  Share a file (default command)
+  shareto init                 Run interactive setup wizard
   shareto list                 List all active shares
   shareto revoke <token|file>  Revoke an active share by token or file path
   shareto status               Check daemon status and systemd lingering
@@ -236,8 +239,8 @@ func runShare(args []string) {
 
 	if strings.Contains(resp.URL, "127.0.0.1") || strings.Contains(resp.URL, "localhost") {
 		fmt.Printf("\n\033[33m[Notice] URL uses loopback address (127.0.0.1) and cannot be opened from other devices.\033[0m\n")
-		fmt.Printf("\033[33m         Set \"public_base_url\" in ~/.config/shareto/config.json (e.g. \"http://your-domain:port\")\033[0m\n")
-		fmt.Printf("\033[33m         or use: shareto --base-url http://your-domain:port <file>\033[0m\n")
+		fmt.Printf("\033[33m         Run 'shareto init' to configure your public domain, port and HTTPS certificate.\033[0m\n")
+		fmt.Printf("\033[33m         Or specify temporarily: shareto --base-url http://your-domain:port <file>\033[0m\n")
 	}
 }
 
