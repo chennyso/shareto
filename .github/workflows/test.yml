@@ -26,3 +26,25 @@ jobs:
       - run: go test -race -count=1 ./internal/... ./cmd/...
       - run: go vet ./internal/... ./cmd/...
       - run: make build
+
+  macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    env:
+      TMPDIR: ${{ github.workspace }}/work/tmp
+      GOTMPDIR: ${{ github.workspace }}/work/tmp
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: mkdir -p work/tmp
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: stable
+      - run: go test -race -count=1 ./...
+      - run: go vet ./...
+      - run: make macos
+      - run: bash packaging/test-macos.sh
+      - run: sudo installer -pkg dist/shareto_*_darwin_universal.pkg -target /
+      - run: /usr/local/bin/shareto version

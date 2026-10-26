@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -26,7 +27,7 @@ func NewClient(customSockPath ...string) *Client {
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return net.DialTimeout("unix", sockPath, 2*time.Second)
+			return dialVerified(ctx, sockPath, 2*time.Second)
 		},
 		DisableKeepAlives: true,
 	}
@@ -41,12 +42,29 @@ func NewClient(customSockPath ...string) *Client {
 }
 
 func (c *Client) Ping() bool {
-	conn, err := net.DialTimeout("unix", c.sockPath, 200*time.Millisecond)
+	conn, err := dialVerified(context.Background(), c.sockPath, 200*time.Millisecond)
 	if err != nil {
 		return false
 	}
 	_ = conn.Close()
 	return true
+}
+
+func dialVerified(ctx context.Context, path string, timeout time.Duration) (net.Conn, error) {
+	address, err := socketAddress(path)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "unix", address)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyPeerUID(conn, uint32(os.Getuid())); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (c *Client) Share(ctx context.Context, req ShareRequest) (*ShareResponse, error) {

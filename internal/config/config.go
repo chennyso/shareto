@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 type Config struct {
@@ -53,6 +54,13 @@ func DefaultConfig() *Config {
 // DefaultConfigPath returns the path to config.json according to XDG spec.
 func DefaultConfigPath() string {
 	configDir := os.Getenv("XDG_CONFIG_HOME")
+	if configDir == "" && runtime.GOOS == "darwin" {
+		var err error
+		configDir, err = os.UserConfigDir()
+		if err != nil {
+			panic(err)
+		}
+	}
 	if configDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {

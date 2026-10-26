@@ -4,7 +4,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`shareto` 是专为 Linux 个人服务器与开发者打造的**极简、高安全、原子配额大文件临时分发工具**（v3.0）。
+`shareto` 面向 Linux 个人服务器和 MacBook 用户，提供带有下载次数、有效期和密码保护的文件分享功能（v3.0）。
 
 它通过内核级系统调用与契约驱动架构，提供比传统网盘、Alist 或网盘挂载工具更安全、更可控的大文件外链分发能力：支持阅后即焚（单次或多次下载额度）、子网绑定、并发限流、防爬虫误扣配额、防篡改熔断，且**全面拥抱 Go 1.22+ 原生标准库路由，零第三方重型 Web 框架**。
 
@@ -31,7 +31,7 @@
   - 创建分享、领取会话和撤销分享均等待状态文件同步、原子重命名及目录同步完成后返回成功。保存失败会向客户端返回错误，已在内存撤销的分享继续拒绝访问。
 - 🔌 **内核级安全的进程间通信 (IPC)**：
   - CLI 与后台守护进程通过 Unix Domain Socket 通信（权限 `0600`）。
-  - 连接时通过系统调用 `SO_PEERCRED` 校验发起端 UID，确保仅允许当前系统用户调用。
+  - Linux 使用 `SO_PEERCRED`，macOS 使用 `LOCAL_PEERCRED`。客户端和后台进程均检查对端用户身份。
 - 📦 **生产级 Systemd 用户服务**：
   - 内置内核沙箱安全指令（`ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges=true`）。
   - CLI 自动检测 Systemd 用户 linger 状态，给出操作建议。
@@ -72,6 +72,23 @@ sequenceDiagram
 ---
 
 ## 🚀 快速上手 (Quick Start)
+
+### MacBook 安装
+
+下载 `shareto_<version>_darwin_universal.pkg`，使用 macOS 安装器打开。安装包同时支持 Apple Silicon 和 Intel，要求 macOS 13 或以后版本。
+
+安装完成后在终端执行：
+
+```bash
+shareto init
+shareto service install
+shareto /path/to/archive.zip
+```
+
+后台服务使用当前登录用户的 launchd LaunchAgent，在用户登录期间运行。
+也提供可安装到用户目录的 `.tar.gz` 文件，具体命令、文件位置和卸载方式见 [MacBook 使用说明](docs/MACOS.md)。
+
+### Linux 安装
 
 ### 1. 通过 APT 软件源安装 (Debian / Ubuntu 推荐)
 

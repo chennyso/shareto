@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,13 @@ type Manager struct {
 // DefaultStatePath returns the path to state.json under $XDG_STATE_HOME.
 func DefaultStatePath() string {
 	stateDir := os.Getenv("XDG_STATE_HOME")
+	if stateDir == "" && runtime.GOOS == "darwin" {
+		var err error
+		stateDir, err = os.UserConfigDir()
+		if err != nil {
+			panic(err)
+		}
+	}
 	if stateDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {

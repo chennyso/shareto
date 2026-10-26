@@ -121,3 +121,37 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./public
           keep_files: false
+
+  build-macos:
+    name: Build macOS Universal Installer
+    needs: build-and-release
+    runs-on: macos-latest
+    env:
+      TMPDIR: ${{ github.workspace }}/work/tmp
+      GOTMPDIR: ${{ github.workspace }}/work/tmp
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: mkdir -p work/tmp
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: stable
+      - name: Verify and Build macOS Packages
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        run: bash packaging/release-macos.sh
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/*_darwin_universal.pkg
+            dist/*_darwin_universal.tar.gz
+            dist/sha256sums-macos.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: |
+            dist/*_darwin_universal.pkg
+            dist/*_darwin_universal.tar.gz
+            dist/sha256sums-macos.txt
