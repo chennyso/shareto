@@ -19,10 +19,10 @@ jobs:
       GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: mkdir -p work/tmp
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: ${{ matrix.go }}
-      - run: mkdir -p work/tmp
       - run: go test -race -count=1 ./internal/... ./cmd/...
       - run: go vet ./internal/... ./cmd/...
       - run: make build
