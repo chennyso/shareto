@@ -20,6 +20,14 @@ func TestIPCCommunication(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	sockPath := filepath.Join(tempDir, "ipc.sock")
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sockPath, err = filepath.Rel(workingDir, sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	statePath := filepath.Join(tempDir, "state.json")
 
 	// Create a dummy file to share

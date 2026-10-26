@@ -8,12 +8,12 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"shareto/internal/config"
+	"shareto/internal/service"
 )
 
 func expandPath(p string) string {
@@ -88,7 +88,8 @@ func runInit() {
 	cfgPath := config.DefaultConfigPath()
 	currentCfg, err := config.LoadOrInit()
 	if err != nil {
-		currentCfg = config.DefaultConfig()
+		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
+		os.Exit(1)
 	}
 
 	// 1. Listen Address and Port
@@ -222,22 +223,21 @@ func runInit() {
 	}
 	fmt.Println()
 
-	// Check systemd service status and offer restart
-	statusCmd := exec.Command("systemctl", "--user", "is-active", "shareto.service")
-	if out, err := statusCmd.Output(); err == nil && strings.TrimSpace(string(out)) == "active" {
-		restartChoice := readLineWithDefault(reader, "shareto.service is currently active. Restart it now? (Y/n)", "Y")
+	active, err := service.Active()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to query user service: %v\n", err)
+		os.Exit(1)
+	}
+	if active {
+		restartChoice := readLineWithDefault(reader, "The shareto user service is active. Restart it now? (Y/n)", "Y")
 		if strings.ToLower(restartChoice) != "n" {
-			if err := exec.Command("systemctl", "--user", "restart", "shareto.service").Run(); err != nil {
-				fmt.Printf("\033[33mFailed to restart systemd service: %v\033[0m\n", err)
-				fmt.Println("You can restart it manually: systemctl --user restart shareto.service")
-			} else {
-				fmt.Println("\033[32m[✓] shareto.service restarted successfully!\033[0m")
+			if err := service.Restart(); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to restart user service: %v\n", err)
+				os.Exit(1)
 			}
+			fmt.Println("[✓] User service restarted successfully.")
 		}
 	} else {
-		fmt.Println("Tip: Start the daemon with:")
-		fmt.Println("     systemctl --user enable --now shareto.service")
-		fmt.Println("  or run foreground:")
-		fmt.Println("     shareto daemon")
+		fmt.Println(service.Instructions())
 	}
 }

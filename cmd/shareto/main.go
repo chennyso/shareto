@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,6 +21,7 @@ import (
 	"shareto/internal/crypto"
 	"shareto/internal/httpd"
 	"shareto/internal/ipc"
+	"shareto/internal/service"
 	"shareto/internal/store"
 
 	"golang.org/x/term"
@@ -47,6 +48,8 @@ func main() {
 		runRevoke()
 	case "status":
 		runStatus()
+	case "service":
+		runService()
 	case "help", "-h", "--help":
 		printUsage()
 	case "version", "-v", "--version":
@@ -58,15 +61,16 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Printf(`shareto v%s - Safe and minimal large file distribution tool for Linux
+	fmt.Printf(`shareto v%s - Safe and minimal large file distribution tool for Linux and macOS
 
 Usage:
   shareto [flags] <file_path>  Share a file (default command)
   shareto init                 Run interactive setup wizard
   shareto list                 List all active shares
   shareto revoke <token|file>  Revoke an active share by token or file path
-  shareto status               Check daemon status and systemd lingering
-  shareto daemon               Start background daemon (usually via systemd)
+  shareto status               Check daemon status
+  shareto service <action>     Install, start, stop, restart or uninstall the user service
+  shareto daemon               Start the daemon in the foreground
 
 Share Flags:
   -t string          Expiration duration (e.g. 30m, 12h, 7d; default "24h")
@@ -99,11 +103,12 @@ func checkAndEnsureDaemonRunning() *ipc.Client {
 		return client
 	}
 
-	// Try starting user service
-	cmd := exec.Command("systemctl", "--user", "start", "shareto.service")
-	_ = cmd.Run()
+	if err := service.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start user service: %v\n", err)
+		return nil
+	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 		if client.Ping() {
@@ -115,6 +120,9 @@ func checkAndEnsureDaemonRunning() *ipc.Client {
 }
 
 func checkLingerWarning() {
+	if runtime.GOOS != "linux" {
+		return
+	}
 	currUser, err := user.Current()
 	if err != nil {
 		return
@@ -202,9 +210,8 @@ func runShare(args []string) {
 
 	client := checkAndEnsureDaemonRunning()
 	if client == nil {
-		fmt.Fprintln(os.Stderr, "Error: shareto daemon is not running and failed to auto-start via systemctl.")
-		fmt.Fprintln(os.Stderr, "Try starting it manually with: systemctl --user start shareto.service")
-		fmt.Fprintln(os.Stderr, "Or run in foreground: shareto daemon")
+		fmt.Fprintln(os.Stderr, "Error: shareto daemon is not available.")
+		fmt.Fprintln(os.Stderr, service.Instructions())
 		os.Exit(1)
 	}
 
@@ -344,6 +351,10 @@ func runStatus() {
 	fmt.Printf("  Uptime:         %s\n", (time.Duration(status.UptimeSec) * time.Second).String())
 	fmt.Printf("  Active Shares:  %d\n", status.ActiveSharesCount)
 	fmt.Printf("  Active Streams: %d\n", status.GlobalActiveConns)
+	if runtime.GOOS == "darwin" {
+		fmt.Println("  User Service:   launchd LaunchAgent (active while logged in)")
+		return
+	}
 
 	currUser, err := user.Current()
 	if err == nil {
@@ -355,6 +366,41 @@ func runStatus() {
 			checkLingerWarning()
 		}
 	}
+}
+
+func runService() {
+	if len(os.Args) != 3 {
+		fmt.Fprintln(os.Stderr, "Usage: shareto service <install|start|stop|restart|uninstall|status>")
+		os.Exit(1)
+	}
+	var err error
+	switch os.Args[2] {
+	case "install":
+		err = service.Install()
+	case "start":
+		err = service.Start()
+	case "stop":
+		err = service.Stop()
+	case "restart":
+		err = service.Restart()
+	case "uninstall":
+		err = service.Uninstall()
+	case "status":
+		var active bool
+		active, err = service.Active()
+		if err == nil {
+			fmt.Printf("User service loaded: %t\n", active)
+			return
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown service action: %s\n", os.Args[2])
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "User service operation failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("User service %s completed.\n", os.Args[2])
 }
 
 func runDaemon() {

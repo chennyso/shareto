@@ -8,14 +8,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"shareto/internal/config"
 	"shareto/internal/store"
-
-	"golang.org/x/sys/unix"
 )
 
 type Server struct {
@@ -40,25 +39,7 @@ func (l *peerCredListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		unixConn, ok := conn.(*net.UnixConn)
-		if !ok {
-			_ = conn.Close()
-			continue
-		}
-
-		raw, err := unixConn.SyscallConn()
-		if err != nil {
-			_ = conn.Close()
-			continue
-		}
-
-		var cred *unix.Ucred
-		var credErr error
-		rawErr := raw.Control(func(fd uintptr) {
-			cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-		})
-
-		if rawErr != nil || credErr != nil || cred == nil || cred.Uid != l.expectedUID {
+		if err := verifyPeerUID(conn, l.expectedUID); err != nil {
 			_ = conn.Close()
 			continue
 		}
@@ -70,6 +51,13 @@ func (l *peerCredListener) Accept() (net.Conn, error) {
 // DefaultSocketPath returns the standard Unix socket path.
 func DefaultSocketPath() string {
 	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" && runtime.GOOS == "darwin" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			panic(err)
+		}
+		return filepath.Join(cacheDir, "shareto", "ipc.sock")
+	}
 	if runtimeDir == "" {
 		uid := os.Getuid()
 		runUser := fmt.Sprintf("/run/user/%d", uid)
@@ -97,16 +85,20 @@ func NewServer(cfg *config.Config, storeMgr *store.Manager, customSockPath ...st
 	}, nil
 }
 
-// Start begins listening on the Unix Domain Socket with SO_PEERCRED checks.
+// Start 在 Unix socket 上验证连接用户的 UID。
 func (s *Server) Start() error {
 	sockDir := filepath.Dir(s.sockPath)
 	if err := os.MkdirAll(sockDir, 0700); err != nil {
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
+	address, err := socketAddress(s.sockPath)
+	if err != nil {
+		return err
+	}
 
 	// Probe old socket
 	if _, err := os.Stat(s.sockPath); err == nil {
-		c, err := net.DialTimeout("unix", s.sockPath, 100*time.Millisecond)
+		c, err := net.DialTimeout("unix", address, 100*time.Millisecond)
 		if err == nil {
 			_ = c.Close()
 			return fmt.Errorf("another daemon instance is already running on %s", s.sockPath)
@@ -114,7 +106,7 @@ func (s *Server) Start() error {
 		_ = os.Remove(s.sockPath)
 	}
 
-	rawListener, err := net.Listen("unix", s.sockPath)
+	rawListener, err := net.Listen("unix", address)
 	if err != nil {
 		return fmt.Errorf("failed to listen on unix socket: %w", err)
 	}
@@ -155,7 +147,6 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
-	_ = os.Remove(s.sockPath)
 	return err
 }
 
