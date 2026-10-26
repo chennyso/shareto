@@ -26,7 +26,7 @@ const (
 var (
 	ErrInvalidHash   = errors.New("invalid argon2id hash format")
 	ErrCSRFExpired   = errors.New("csrf token expired")
-	ErrCSRFMismatch   = errors.New("csrf token mismatch")
+	ErrCSRFMismatch  = errors.New("csrf token mismatch")
 	ErrCSRFMalformed = errors.New("csrf token malformed")
 )
 
@@ -88,6 +88,9 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &threads); err != nil {
 		return false, fmt.Errorf("failed to parse argon2 parameters: %w", err)
 	}
+	if memory != argonMemory || iterations != argonTime || threads != argonThreads {
+		return false, ErrInvalidHash
+	}
 
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {
@@ -107,7 +110,10 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 		}
 	}
 
-	computedHash := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(expectedHash)))
+	if len(salt) != argonSaltLen || len(expectedHash) != argonKeyLen {
+		return false, ErrInvalidHash
+	}
+	computedHash := argon2.IDKey([]byte(password), salt, iterations, memory, threads, argonKeyLen)
 
 	if subtle.ConstantTimeCompare(computedHash, expectedHash) == 1 {
 		return true, nil

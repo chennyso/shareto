@@ -10,7 +10,7 @@
 
 1. **编译环境**：Go 1.22+，强制 `CGO_ENABLED=0`，目标平台 `GOOS=linux`。
 2. **最小外部依赖**：仅允许引入 `golang.org/x/crypto`（用于 Argon2id）、`golang.org/x/sys/unix`（用于 `SO_PEERCRED` 与底层系统调用）、`golang.org/x/term`（用于终端无回显读密码）和 `[github.com/pelletier/go-toml/v2](https://github.com/pelletier/go-toml/v2)`（或使用标准库 JSON 替代配置以实现零第三方库）。**严禁引入 Gin/Echo 等重型 Web 框架**，全面使用 Go 1.22+ 增强版标准库 `net/http` 路由。
-3. **无省略实现**：所有安全校验逻辑（Inode 锁定、`pread` 流式读取、滑动窗口慢速断开、有界 LRU 限频、CSRF 一次性令牌）必须完整编写，严禁使用 `// TODO` 占位符。
+3. **无省略实现**：文件元数据验证、`pread` 流式读取、慢速连接断开、有界 LRU 限频和具有有效期的 HMAC CSRF 令牌均须完整实现。
 
 ---
 
@@ -67,6 +67,9 @@ type Config struct {
     TLS                 TLSConfig`json:"tls"`
     TrustedProxies      []string `json:"trusted_proxies"`       // 默认 ["127.0.0.1/32", "::1/128"]
     MaxGlobalStreams    int      `json:"max_global_streams"`    // 默认 64
+    MaxConnections      int      `json:"max_connections"`       // 默认 256
+    MaxConnectionsPerIP int      `json:"max_connections_per_ip"` // 默认 32
+    MaxConcurrentAuth   int      `json:"max_concurrent_auth"`   // 默认 2
     MaxStreamsPerToken  int      `json:"max_streams_per_token"` // 默认 16
     MaxStreamsPerSession int     `json:"max_streams_per_session"`// 默认 8
     MaxActiveShares     int      `json:"max_active_shares"`     // 默认 100
@@ -99,6 +102,7 @@ type ShareEntry struct {
     Inode              uint64                      `json:"inode"`               // stat.Ino
     FileSize           int64                       `json:"file_size"`           // 初始字节大小
     MtimeUnixNano      int64                       `json:"mtime_unix_nano"`     // 初始修改时间(纳秒)
+    CtimeUnixNano      int64                       `json:"ctime_unix_nano"`     // 初始元数据变化时间(纳秒)
     PasswordHash       string                      `json:"password_hash,omitempty"` // Argon2id 编码字符串，空表示无密码
     CreatedAt          time.Time                   `json:"created_at"`
     ExpiresAt          time.Time                   `json:"expires_at"`
@@ -142,9 +146,9 @@ type DownloadSession struct {
 
 2. **完整性复核与并发安全读取器 `GetSectionReader(entry *ShareEntry) (*io.SectionReader, time.Time, error)**`：
 * 对 `entry.pinnedFile` 调用 `Stat()`：
-* 核对 `stat_t.Dev == entry.DeviceID`、`stat_t.Ino == entry.Inode`、`fi.Size() == entry.FileSize` 以及 `fi.ModTime().UnixNano() == entry.MtimeUnixNano`。
-* **熔断机制**：若任一指标不匹配，说明文件在分享期间被篡改或截断，立即返回特定错误 `ErrFileMutated`，调用方捕获后将该分享从管理器中移除并返回 `HTTP 410 Gone`。
-* 校验通过后，返回 `io.NewSectionReader(entry.pinnedFile, 0, entry.FileSize)`。因为 `io.SectionReader` 实现了 `io.ReadSeeker` 且底层完全通过 `pread` (`ReadAt`) 实现，直接将其传入 `http.ServeContent` 可实现 100% 协程安全的并发 Range 传输。
+* 核对设备编号、inode、文件大小、mtime 和 ctime。平台相关的 ctime 提取位于 `filetime_linux.go` 与 `filetime_darwin.go`。
+* `io.SectionReader` 的底层为 `verifiedReaderAt`，每次读取数据前后均检查元数据。检测到修改时返回零字节及 `ErrFileMutated`，本次读取结果不得发送给客户端。
+* 尚未发送正文的请求返回 `410`；已经发送响应头的传输使用 `http.ErrAbortHandler` 终止连接，并通过管理器持久化撤销该分享。Range 请求继续通过独立的 `SectionReader` 使用 `pread` 读取文件。
 
 
 
@@ -157,7 +161,9 @@ type DownloadSession struct {
 2. **Argon2id 密码哈希与校验**：
 * 参数固定：`time = 1`, `memory = 64 * 1024` (64MB), `threads = 2`, `keyLen = 32`, `saltLen = 16`。
 * 存储格式：`$argon2id$v=19$m=65536,t=1,p=2$<base64_salt>$<base64_hash>`。
-* 验证时先获取 `entry.authSem <- struct{}{}`（带 5 秒 Context 超时，超时直接返回 `503 Service Unavailable`），计算输入密码的 Argon2id 哈希后，使用 `subtle.ConstantTimeCompare(hash1, hash2) == 1` 比对。
+* 验证时通过 `Manager.AcquireAuthSlots` 同时获取全局及单个分享的验证名额，无法获取时立即返回 `503`。全部分享的默认并发上限为二，每个分享的并发上限为二。
+* 通过 `RateLimiter.BeginAttempt` 原子预留一次验证尝试，无法预留时返回 `429`。验证完成后记录成功或失败，并释放两个层级的验证名额。
+* 编码哈希的 Argon2id 参数、salt 长度和输出长度必须符合固定配置，再计算哈希并使用 `subtle.ConstantTimeCompare` 比较。
 
 
 
@@ -179,11 +185,12 @@ type DownloadSession struct {
 
 * 使用 `sync.Mutex` + 标准库 `container/list` + `map[string]*list.Element` 实现最大容量为 `65536` 的 LRU 缓存。
 * 键格式：`fmt.Sprintf("%s|%s", token, RateLimitKey(clientIP))`。
-* 值结构：`{ Failures int; WindowStart time.Time; LockedUntil time.Time }`。
+* 值结构包含失败次数、时间窗口、锁定期限和正在验证的请求数量。
 * 规则：
 * 请求到达时，若 `Now < LockedUntil`，直接拒绝并返回剩余锁定秒数。
 * 若密码错误或请求无效，在 1 分钟窗口内累加 `Failures`；当 `Failures >= 5` 时，设置 `LockedUntil = Now.Add(15 * time.Minute)`。
-* 当缓存条目超过 `65536` 时，淘汰链表尾部最久未使用的条目，确保内存占用恒定小于 10MB。
+* 失败次数与正在验证的数量之和达到五次时拒绝新尝试。正在验证的条目保留在缓存中，容量不足且全部条目均有正在验证的请求时拒绝预留。
+* 缓存容量最多 `65536`，插入新条目前删除最久未使用且没有正在验证请求的条目。
 
 
 
@@ -216,11 +223,11 @@ type DownloadSession struct {
 
 ### 4.2 阶段一：`GET /s/{token}` 详解
 
-1. 查找 `token`，若不存在、已过期、`RemainingDownloads <= 0` 或文件被篡改，返回 `404 Not Found`（或 `410 Gone`）统一极简错误页。
+1. 查找 `token`，若不存在、已过期或文件已被修改，返回 `404` 或 `410`。额度耗尽时拒绝新领取，既有下载会话保持其有效期。
 2. **终端直链兼容模式**：
 * 若该分享**无密码**，且满足：`r.URL.Query().Get("raw") == "1"` 或 `r.Header.Get("X-Shareto-Direct") == "1"`：
 * 检查 `User-Agent` 黑名单（拦截包含 `MicroMessenger`, `TelegramBot`, `Twitterbot`, `Slackbot`, `Discordbot`, `facebookexternalhit`, `WhatsApp`, `Applebot` 的预览爬虫，若命中则仍返回普通 HTML 页）。
-* 非爬虫时，直接调用 `ClaimSession(token, clientIP)` 扣减 1 次额度并生成 Session，返回 `307 Temporary Redirect` 至 `/d/{token}/{session}/{url_encoded_filename}`。
+* 非爬虫的 `GET` 请求调用 `ClaimSession(token, clientIP)`，同步保存领取额度与 Session，成功后返回 `307`。`HEAD` 仅返回页面元数据，保存失败返回 `503`。
 
 
 3. **正常浏览器访问**：
@@ -231,16 +238,16 @@ type DownloadSession struct {
 
 ### 4.3 阶段二：`POST /s/{token}/claim` 详解
 
-1. 使用 `http.MaxBytesReader(w, r.Body, 4096)` 限制请求体大小。
-2. 校验 `csrf_token` 签名与时间戳（防重放与跨站自动提交）。
+1. 使用 `http.MaxBytesReader(w, r.Body, 4096)` 限制请求体大小，HTTP Server 设置 5 秒请求读取期限，监听器限制全部连接和单个来源的连接数量。
+2. 校验 `csrf_token` 签名、有效期、分享编号及客户端网段。
 3. 检查该 `(token, clientIP)` 是否被限频器锁定；若锁定返回 `429 Too Many Requests`。
-4. 若分享设置了密码，执行 Argon2id 验证；若失败，调用限频器 `RecordFailure` 并返回 `403` 重新渲染带错误提示的落地页。
+4. 若分享设置密码，申请全局和单个分享的验证名额，再原子预留尝试次数。Argon2id 验证失败返回 `403`，次数不足返回 `429`，验证名额不足返回 `503`。
 5. **原子扣减与 Session 签发**：
 * 加锁检查 `entry.RemainingDownloads > 0`；
 * `entry.RemainingDownloads--`；
 * 生成 22 字符 `sessionID`，记录 `SubnetKey: SessionSubnetKey(clientIP)`，有效期设为 `min(Now+2h, entry.ExpiresAt)`；
 * 若当前 `len(entry.Sessions) >= 128`，淘汰最早创建的非活跃 Session；
-* 触发状态原子落盘 `SaveState()`；
+* 同步保存状态，完成文件同步、原子重命名及目录同步；保存失败时恢复尚未提交的内存变更并返回 `503`；
 * 返回 `303 See Other`，`Location: /d/{token}/{sessionID}/{url.PathEscape(entry.FileName)}`。
 
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"shareto/internal/config"
@@ -22,9 +23,14 @@ type Server struct {
 	rateLimiter *netutil.RateLimiter
 	httpServer  *http.Server
 	listener    net.Listener
+	listenerMu  sync.RWMutex
+	trusted     []*net.IPNet
 }
 
 func NewServer(cfg *config.Config, storeMgr *store.Manager) (*Server, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	trustedCIDRs, err := netutil.ParseCIDRs(cfg.TrustedProxies)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse trusted proxies: %w", err)
@@ -51,7 +57,9 @@ func NewServer(cfg *config.Config, storeMgr *store.Manager) (*Server, error) {
 		Addr:              cfg.ListenAddr,
 		Handler:           secureHandler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 * 1024,
 	}
 
 	return &Server{
@@ -59,6 +67,7 @@ func NewServer(cfg *config.Config, storeMgr *store.Manager) (*Server, error) {
 		storeMgr:    storeMgr,
 		rateLimiter: rateLimiter,
 		httpServer:  srv,
+		trusted:     trustedCIDRs,
 	}, nil
 }
 
@@ -74,35 +83,34 @@ func expandPath(p string) string {
 
 // Start listens and serves HTTP/HTTPS traffic.
 func (s *Server) Start() error {
-	var ln net.Listener
-	var err error
+	raw, err := net.Listen("tcp", s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", s.cfg.ListenAddr, err)
+	}
+	var ln net.Listener = netutil.NewLimitedListener(raw, s.cfg.MaxConnections, s.cfg.MaxConnectionsPerIP, s.trusted)
 
 	if s.cfg.TLS.Enabled {
 		if s.cfg.TLS.CertFile == "" || s.cfg.TLS.KeyFile == "" {
+			raw.Close()
 			return fmt.Errorf("TLS is enabled but cert_file or key_file is missing")
 		}
 		certPath := expandPath(s.cfg.TLS.CertFile)
 		keyPath := expandPath(s.cfg.TLS.KeyFile)
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
+			raw.Close()
 			return fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		ln, err = tls.Listen("tcp", s.cfg.ListenAddr, tlsConfig)
-		if err != nil {
-			return fmt.Errorf("failed to listen on %s: %w", s.cfg.ListenAddr, err)
-		}
-	} else {
-		ln, err = net.Listen("tcp", s.cfg.ListenAddr)
-		if err != nil {
-			return fmt.Errorf("failed to listen on %s: %w", s.cfg.ListenAddr, err)
-		}
+		ln = tls.NewListener(ln, tlsConfig)
 	}
 
+	s.listenerMu.Lock()
 	s.listener = ln
+	s.listenerMu.Unlock()
 	return s.httpServer.Serve(ln)
 }
 
@@ -116,6 +124,8 @@ func (s *Server) Stop(ctx context.Context) error {
 
 // Addr returns the bound network address.
 func (s *Server) Addr() net.Addr {
+	s.listenerMu.RLock()
+	defer s.listenerMu.RUnlock()
 	if s.listener != nil {
 		return s.listener.Addr()
 	}

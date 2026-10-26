@@ -53,7 +53,7 @@ func OpenAndPinFile(rawPath string) (*os.File, os.FileInfo, uint64, uint64, erro
 		return nil, nil, 0, 0, errors.New("failed to retrieve syscall.Stat_t")
 	}
 
-	return file, fi, statT.Dev, statT.Ino, nil
+	return file, fi, uint64(statT.Dev), statT.Ino, nil
 }
 
 // GetSectionReader verifies that the pinned file has not been altered, truncated, or replaced,
@@ -63,26 +63,43 @@ func GetSectionReader(entry *ShareEntry) (*io.SectionReader, time.Time, error) {
 	f := entry.PinnedFile
 	entry.Mu.Unlock()
 
-	if f == nil {
-		return nil, time.Time{}, ErrFileMutated
+	reader := &verifiedReaderAt{file: f, entry: entry}
+	if err := reader.verify(); err != nil {
+		return nil, time.Time{}, err
 	}
+	return io.NewSectionReader(reader, 0, entry.FileSize), time.Unix(0, entry.MtimeUnixNano), nil
+}
 
-	fi, err := f.Stat()
+type verifiedReaderAt struct {
+	file  *os.File
+	entry *ShareEntry
+}
+
+func (r *verifiedReaderAt) verify() error {
+	if r.file == nil || r.entry.mutated.Load() {
+		return ErrFileMutated
+	}
+	fi, err := r.file.Stat()
 	if err != nil {
-		return nil, time.Time{}, ErrFileMutated
+		r.entry.mutated.Store(true)
+		return ErrFileMutated
 	}
-
 	statT, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, time.Time{}, ErrFileMutated
+	if !ok || uint64(statT.Dev) != r.entry.DeviceID || statT.Ino != r.entry.Inode || fi.Size() != r.entry.FileSize || fi.ModTime().UnixNano() != r.entry.MtimeUnixNano || fileChangeTime(fi) != r.entry.CtimeUnixNano {
+		r.entry.mutated.Store(true)
+		return ErrFileMutated
 	}
+	return nil
+}
 
-	if statT.Dev != entry.DeviceID ||
-		statT.Ino != entry.Inode ||
-		fi.Size() != entry.FileSize ||
-		fi.ModTime().UnixNano() != entry.MtimeUnixNano {
-		return nil, time.Time{}, ErrFileMutated
+func (r *verifiedReaderAt) ReadAt(p []byte, offset int64) (int, error) {
+	if err := r.verify(); err != nil {
+		return 0, err
 	}
-
-	return io.NewSectionReader(f, 0, entry.FileSize), fi.ModTime(), nil
+	n, err := r.file.ReadAt(p, offset)
+	// 修改过的读取结果必须在返回给 HTTP 发送代码之前丢弃。
+	if verifyErr := r.verify(); verifyErr != nil {
+		return 0, verifyErr
+	}
+	return n, err
 }

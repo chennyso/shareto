@@ -1,9 +1,9 @@
 package httpd
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -83,7 +83,10 @@ func (h *ShareHandler) HandleGetShare(w http.ResponseWriter, r *http.Request) {
 
 	// Verify file integrity
 	if _, _, err := store.GetSectionReader(entry); err != nil {
-		h.storeMgr.RemoveShare(token)
+		if err := h.storeMgr.RemoveShare(token); err != nil {
+			h.renderError(w, http.StatusServiceUnavailable, "Storage Unavailable", "Unable to persist share removal.")
+			return
+		}
 		h.renderError(w, http.StatusGone, "File Unavailable", "The original file has been altered or removed.")
 		return
 	}
@@ -93,11 +96,15 @@ func (h *ShareHandler) HandleGetShare(w http.ResponseWriter, r *http.Request) {
 
 	// Direct link terminal mode: raw=1 or X-Shareto-Direct: 1
 	isRaw := r.URL.Query().Get("raw") == "1" || r.Header.Get("X-Shareto-Direct") == "1"
-	if isRaw && entry.PasswordHash == "" {
+	if r.Method == http.MethodGet && isRaw && entry.PasswordHash == "" {
 		if !isCrawler(r.UserAgent()) {
 			_, session, err := h.storeMgr.ClaimSession(token, clientIP)
 			if err != nil {
-				h.renderError(w, http.StatusGone, "Link Expired", err.Error())
+				if errors.Is(err, store.ErrDownloadExhausted) || errors.Is(err, store.ErrShareExpired) || errors.Is(err, store.ErrShareNotFound) {
+					h.renderError(w, http.StatusGone, "Link Expired", "This share is no longer available.")
+				} else {
+					h.renderError(w, http.StatusServiceUnavailable, "Storage Unavailable", "Unable to persist download authorization.")
+				}
 				return
 			}
 			redirectURL := fmt.Sprintf("/d/%s/%s/%s", token, session.SessionID, url.PathEscape(entry.FileName))
@@ -114,7 +121,7 @@ func (h *ShareHandler) HandleGetShare(w http.ResponseWriter, r *http.Request) {
 		Token:              entry.Token,
 		FileName:           entry.FileName,
 		FileSizeFormatted:  FormatBytes(entry.FileSize),
-		RemainingDownloads: entry.RemainingDownloads,
+		RemainingDownloads: entry.Remaining(),
 		ExpiresAtFormatted: entry.ExpiresAt.Format("2006-01-02 15:04:05 MST"),
 		HasPassword:        entry.PasswordHash != "",
 		CSRFToken:          csrfToken,
@@ -163,21 +170,24 @@ func (h *ShareHandler) HandleClaimShare(w http.ResponseWriter, r *http.Request) 
 	if entry.PasswordHash != "" {
 		password := r.FormValue("password")
 
-		// Acquire auth semaphore with 5-second context timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-
-		select {
-		case entry.AuthSem <- struct{}{}:
-			defer func() { <-entry.AuthSem }()
-		case <-ctx.Done():
+		release, err := h.storeMgr.AcquireAuthSlots(entry)
+		if err != nil {
+			w.Header().Set("Retry-After", "1")
 			h.renderError(w, http.StatusServiceUnavailable, "Service Unavailable", "Authentication server is currently busy, please retry.")
+			return
+		}
+		defer release()
+		finishAttempt, retryAfter := h.rateLimiter.BeginAttempt(token, clientIP)
+		if finishAttempt == nil {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+			h.renderError(w, http.StatusTooManyRequests, "Too Many Requests", "Too many password attempts. Please wait before retrying.")
 			return
 		}
 
 		valid, err := crypto.VerifyPassword(password, entry.PasswordHash)
+		finishAttempt(err == nil && valid)
 		if err != nil || !valid {
-			locked, rem := h.rateLimiter.RecordFailure(token, clientIP)
+			locked, rem := h.rateLimiter.IsLocked(token, clientIP)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusForbidden)
 			errMsg := "Incorrect password. Please try again."
@@ -189,7 +199,7 @@ func (h *ShareHandler) HandleClaimShare(w http.ResponseWriter, r *http.Request) 
 				Token:              entry.Token,
 				FileName:           entry.FileName,
 				FileSizeFormatted:  FormatBytes(entry.FileSize),
-				RemainingDownloads: entry.RemainingDownloads,
+				RemainingDownloads: entry.Remaining(),
 				ExpiresAtFormatted: entry.ExpiresAt.Format("2006-01-02 15:04:05 MST"),
 				HasPassword:        true,
 				CSRFToken:          newCSRF,
@@ -197,9 +207,6 @@ func (h *ShareHandler) HandleClaimShare(w http.ResponseWriter, r *http.Request) 
 			})
 			return
 		}
-
-		// Reset rate limit on success
-		h.rateLimiter.Reset(token, clientIP)
 	}
 
 	// 5. Claim session and decrement download quota atomically
@@ -209,7 +216,7 @@ func (h *ShareHandler) HandleClaimShare(w http.ResponseWriter, r *http.Request) 
 			h.renderError(w, http.StatusGone, "Download Limit Exceeded", "The download limit for this link has been reached.")
 			return
 		}
-		h.renderError(w, http.StatusInternalServerError, "Server Error", err.Error())
+		h.renderError(w, http.StatusServiceUnavailable, "Storage Unavailable", "Unable to persist download authorization.")
 		return
 	}
 
@@ -252,7 +259,10 @@ func (h *ShareHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	// 4. SectionReader and mutation check
 	reader, mtime, err := store.GetSectionReader(entry)
 	if err != nil {
-		h.storeMgr.RemoveShare(token)
+		if err := h.storeMgr.RemoveShare(token); err != nil {
+			h.renderError(w, http.StatusServiceUnavailable, "Storage Unavailable", "Unable to persist share removal.")
+			return
+		}
 		h.renderError(w, http.StatusGone, "File Mutated", "The shared file has been altered or replaced.")
 		return
 	}
@@ -275,4 +285,10 @@ func (h *ShareHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.ServeContent(targetW, r, "", mtime, reader)
+	if entry.FileMutated() {
+		if err := h.storeMgr.RemoveShare(token); err != nil {
+			log.Printf("failed to persist mutated share removal: %v", err)
+		}
+		panic(http.ErrAbortHandler)
+	}
 }

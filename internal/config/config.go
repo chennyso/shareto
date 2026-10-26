@@ -8,8 +8,8 @@ import (
 )
 
 type Config struct {
-	ListenAddr           string    `json:"listen_addr"`             // 默认 "127.0.0.1:38080"
-	PublicBaseURL        string    `json:"public_base_url"`         // 默认 "https://share.example.com"
+	ListenAddr           string    `json:"listen_addr"`     // 默认 "127.0.0.1:38080"
+	PublicBaseURL        string    `json:"public_base_url"` // 默认 "https://share.example.com"
 	TLS                  TLSConfig `json:"tls"`
 	TrustedProxies       []string  `json:"trusted_proxies"`         // 默认 ["127.0.0.1/32", "::1/128"]
 	MaxGlobalStreams     int       `json:"max_global_streams"`      // 默认 64
@@ -17,6 +17,9 @@ type Config struct {
 	MaxStreamsPerSession int       `json:"max_streams_per_session"` // 默认 8
 	MaxActiveShares      int       `json:"max_active_shares"`       // 默认 100
 	MinTransferRateKBps  int       `json:"min_transfer_rate_kbps"`  // 默认 16 (即 16KB/s)
+	MaxConnections       int       `json:"max_connections"`
+	MaxConnectionsPerIP  int       `json:"max_connections_per_ip"`
+	MaxConcurrentAuth    int       `json:"max_concurrent_auth"`
 }
 
 type TLSConfig struct {
@@ -41,6 +44,9 @@ func DefaultConfig() *Config {
 		MaxStreamsPerSession: 8,
 		MaxActiveShares:      100,
 		MinTransferRateKBps:  16,
+		MaxConnections:       256,
+		MaxConnectionsPerIP:  32,
+		MaxConcurrentAuth:    2,
 	}
 }
 
@@ -81,7 +87,23 @@ func LoadOrInit(customPath ...string) (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config JSON: %w", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func (c *Config) Validate() error {
+	if c.MaxConnections < 1 || c.MaxConnections > 65536 || c.MaxConnectionsPerIP < 1 || c.MaxConnectionsPerIP > c.MaxConnections {
+		return fmt.Errorf("connection limits must satisfy 1 <= max_connections_per_ip <= max_connections <= 65536")
+	}
+	if c.MaxConcurrentAuth < 1 || c.MaxConcurrentAuth > 16 {
+		return fmt.Errorf("max_concurrent_auth must be between 1 and 16")
+	}
+	if c.MaxActiveShares < 1 || c.MaxGlobalStreams < 1 || c.MaxStreamsPerToken < 1 || c.MaxStreamsPerSession < 1 || c.MinTransferRateKBps < 0 {
+		return fmt.Errorf("share and stream limits must be positive and transfer rate must be nonnegative")
+	}
+	return nil
 }
 
 // SaveConfig writes the config to disk with restricted permissions.

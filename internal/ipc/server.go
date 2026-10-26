@@ -197,11 +197,11 @@ type RevokeResponse struct {
 }
 
 type StatusResponse struct {
-	PID                int    `json:"pid"`
-	UptimeSec          int64  `json:"uptime_sec"`
-	GlobalActiveConns  int32  `json:"global_active_conns"`
-	ActiveSharesCount  int    `json:"active_shares_count"`
-	Version            string `json:"version"`
+	PID               int    `json:"pid"`
+	UptimeSec         int64  `json:"uptime_sec"`
+	GlobalActiveConns int32  `json:"global_active_conns"`
+	ActiveSharesCount int    `json:"active_shares_count"`
+	Version           string `json:"version"`
 }
 
 func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
@@ -243,7 +243,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 			FileName:           entry.FileName,
 			FilePath:           entry.FilePath,
 			FileSize:           entry.FileSize,
-			RemainingDownloads: entry.RemainingDownloads,
+			RemainingDownloads: entry.Remaining(),
 			MaxDownloads:       entry.MaxDownloads,
 			ActiveStreams:      entry.ActiveConns.Load(),
 			HasPassword:        entry.PasswordHash != "",

@@ -1,6 +1,4 @@
-# shareto - 极简安全的大文件临时分发服务架构与安全规范 (v2.0 深度加固版)
-
-> 本规范在吸收第一轮安全审计意见后进行了全面重构，收敛了不切实际的“绝对安全”表述，补齐了 TLS 传输加密、用户权限隔离、防爆破限频、原子计数与 DoS 边界控制。
+# shareto 服务架构与安全规范
 
 ---
 
@@ -34,7 +32,7 @@
 3. **安全的文件注册校验流程**：
    - **路径规范化**：通过 `filepath.Abs` 和 `filepath.EvalSymlinks` 彻底解开软链接，定位真实物理路径；
    - **普通文件校验**：严格验证 `fileInfo.Mode().IsRegular()`，直接拒绝设备文件（`/dev/...`）、目录、套接字或命名管道（FIFO）；
-   - **句柄锁定 (Handle Pinning)**：注册阶段直接以只读模式（`os.OpenFile(path, os.O_RDONLY, 0)`）打开文件并保留句柄，或在每次请求时通过 fstat 校验 inode 一致性，防范 TOCTOU（Time-of-Check to Time-of-Use）路径替换竞争。
+   - **文件句柄固定 (Handle Pinning)**：注册阶段以 `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` 打开文件并保留句柄。每次 `ReadAt` 前后核对设备编号、inode、文件大小、mtime 和 ctime；检查失败时丢弃本次读取结果、撤销分享并终止传输。
 
 ---
 
@@ -85,7 +83,8 @@ func VerifyPassword(input, expected string) bool {
 - **Token 级别 + 客户端 IP 级别双重限频**：
   - 每个 Token 针对单个 IP 限制每分钟最多尝试 5 次；
   - 连续输错 5 次后，强制锁定该 IP 针对该 Token 的访问 15 分钟；
-  - 限制最大并发验证协程数，从根本上粉碎在线撞库爆破。
+  - 全部分享默认最多并发验证两个密码，每次使用 64 MiB Argon2id 工作内存；单个分享最多占用两个名额，无法取得名额的请求返回 `503`。
+  - 正在验证的请求预留尝试次数，失败次数与正在验证的数量之和达到五次时拒绝继续验证。
 
 ### 4.4 敏感参数防历史记录泄露
 - CLI 提供交互式隐藏输入（`shareto -p` 不跟参数时触发终端 `term.ReadPassword` 无回显输入）；
@@ -140,11 +139,13 @@ Cache-Control: private, no-transform
 ```go
 srv := &http.Server{
     ReadHeaderTimeout: 5 * time.Second,  // 防范 Slowloris 慢速请求头攻击
+    ReadTimeout:       5 * time.Second,  // 限制完整请求的读取时间
     IdleTimeout:       60 * time.Second, // 及时回收空闲持久连接
     MaxHeaderBytes:    64 * 1024,        // 限制请求头大小 64KB
 }
 ```
 - **活跃连接与并发限额**：
+  - 全部 HTTP 连接默认最多 256 个，单个来源 IPv4 地址或 IPv6 /64 网段默认最多 32 个；可信代理使用全部连接上限；
   - 单个 Token 最大并发连接数限制（默认 16）；
   - 全局最大并发下载连接数限制（默认 64）；
   - 最大存活分享条目限制（默认 100 条）。
@@ -154,10 +155,11 @@ srv := &http.Server{
 
 ### 7.2 持久化与重启语义定义
 - **默认策略：原子持久化**：
-  - 分享规则持久化到 `$XDG_CONFIG_HOME/shareto/shares.json`；
-  - 写入使用“临时文件 + 原子重命名（Atomic Rename）”，防断电损坏；
-  - **重启行为**：服务重启时自动加载尚未过期的规则，重新校验目标文件有效性；已过期的规则自动丢弃清理；
-  - **正在传输中断**：进程收到 `SIGTERM` 时执行 `server.Shutdown` 优雅停机（Graceful Shutdown，等待正在传输的请求最多 15 秒后退出）。
+  - 分享规则持久化到 `$XDG_STATE_HOME/shareto/state.json`；
+  - 状态变更按照同一个互斥锁串行提交，写入临时文件后执行文件同步、原子重命名和目录同步，完成后返回成功；
+  - 领取会话保存失败时返回错误，并恢复尚未提交的领取额度和会话集合；撤销保存失败时返回错误，当前进程继续拒绝已经撤销的分享；
+  - **重启行为**：加载尚未过期的规则并重新校验文件，保留额度已经耗尽且仍有有效下载会话的分享；状态文件损坏时启动失败；
+  - **正在传输中断**：进程收到 `SIGTERM` 时执行 `server.Shutdown`，等待正在传输的请求最多 5 秒后退出。
 
 ---
 
