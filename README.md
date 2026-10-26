@@ -73,7 +73,43 @@ sequenceDiagram
 
 ## 🚀 快速上手 (Quick Start)
 
-### 1. 源码编译
+### 1. 通过 APT 软件源安装 (Debian / Ubuntu 推荐)
+
+我们提供了基于 GitHub Pages 维护的官方 APT 仓库，支持 `amd64` 与 `arm64`：
+
+#### 一键安装
+```bash
+curl -fsSL https://huadaox.github.io/shareto/install.sh | sudo bash
+```
+
+#### 手动添加软件源
+```bash
+# 1. 导入 GPG 公钥
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://huadaox.github.io/shareto/key.gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/shareto.gpg
+sudo chmod a+r /etc/apt/keyrings/shareto.gpg
+
+# 2. 添加 APT 软件源
+echo "deb [signed-by=/etc/apt/keyrings/shareto.gpg] https://huadaox.github.io/shareto stable main" | sudo tee /etc/apt/sources.list.d/shareto.list > /dev/null
+
+# 3. 安装 shareto
+sudo apt update && sudo apt install -y shareto
+```
+
+### 2. 通过 GitHub Releases 下载安装包
+
+前往 [GitHub Releases](https://github.com/huadaox/shareto/releases) 页面下载对应架构的包：
+
+- **Debian / Ubuntu** (`.deb`):
+  ```bash
+  sudo dpkg -i shareto_<version>_amd64.deb
+  ```
+- **RHEL / CentOS / Rocky / Fedora** (`.rpm`):
+  ```bash
+  sudo rpm -ivh shareto-<version>-1.x86_64.rpm
+  ```
+
+### 3. 源码编译
 
 环境要求：Linux，Go 1.22+。
 
@@ -86,20 +122,24 @@ make build
 ```
 编译产物位于 `dist/shareto`。
 
-### 2. 多 Linux 发行版打包与安装 (.deb / .rpm / .tar.gz)
+### 4. 本地打包与构建 (.deb / .rpm / .tar.gz)
 
-本项目内置 `nfpm` 打包工作流，一条命令自动编译并构建覆盖全 Linux 发行版的安装包：
+本项目内置 `nfpm` 打包工作流，一条命令自动编译并构建覆盖主流架构的安装包：
 
 ```bash
-# 一键生成全平台打包文件 (.deb, .rpm, .tar.gz)
+# 生成当前架构的 deb/rpm/tarball
 make package
+
+# 或一键编译生成全架构包 (amd64, arm64)
+make package-all
 ```
-产物说明与安装命令：
+
+本地安装说明：
 - **Debian / Ubuntu** (`.deb`)：
   ```bash
   sudo dpkg -i dist/shareto_3.0.0_amd64.deb
   ```
-- **RHEL / CentOS / Rocky / Fedora / openSUSE** (`.rpm`)：
+- **RHEL / CentOS / Rocky / Fedora** (`.rpm`)：
   ```bash
   sudo rpm -Uvh dist/shareto-3.0.0-1.x86_64.rpm
   ```

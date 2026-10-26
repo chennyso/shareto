@@ -3,6 +3,8 @@ ARCH ?= amd64
 RPM_ARCH ?= $(ARCH)
 ifeq ($(ARCH),amd64)
 	RPM_ARCH := x86_64
+else ifeq ($(ARCH),arm64)
+	RPM_ARCH := aarch64
 endif
 BINARY := dist/shareto
 
@@ -37,6 +39,12 @@ tarball: build
 	@echo "created tarball: dist/shareto_$(VERSION)_linux_$(ARCH).tar.gz"
 
 package: deb rpm tarball
+
+package-all:
+	@for arch in amd64 arm64; do \
+		echo "===> Building packages for $$arch..."; \
+		$(MAKE) package ARCH=$$arch; \
+	done
 
 clean:
 	rm -rf dist/
