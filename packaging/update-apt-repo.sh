@@ -62,7 +62,7 @@ else
     echo "Adding deb packages to repository..."
     for deb in "${DEB_FILES[@]}"; do
         echo "Processing ${deb}..."
-        reprepro -b "${REPO_DIR}" --ignore=alreadyincluded --ignore=missingfield includedeb stable "${deb}"
+        reprepro -b "${REPO_DIR}" includedeb stable "${deb}" || true
     done
 fi
 
