@@ -70,3 +70,15 @@ func TestCSRFTokenVerification(t *testing.T) {
 		t.Fatalf("Expected error for expired token")
 	}
 }
+
+func TestArgon2RejectsUnboundedParameters(t *testing.T) {
+	for _, hash := range []string{
+		"$argon2id$v=19$m=4294967295,t=1,p=2$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		"$argon2id$v=19$m=65536,t=0,p=0$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		"$argon2id$v=19$m=65536,t=1,p=2$$",
+	} {
+		if valid, err := crypto.VerifyPassword("password", hash); valid || err == nil {
+			t.Fatalf("invalid authentication parameters accepted: %v", err)
+		}
+	}
+}

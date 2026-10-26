@@ -26,33 +26,35 @@ type PersistentState struct {
 }
 
 type ShareEntry struct {
-	Token              string                      `json:"token"`                   // 22字符 base64url (128-bit)
-	FilePath           string                      `json:"file_path"`               // EvalSymlinks 后的绝对物理路径
-	FileName           string                      `json:"file_name"`               // 展示与下载文件名
-	DeviceID           uint64                      `json:"device_id"`               // stat.Dev
-	Inode              uint64                      `json:"inode"`                   // stat.Ino
-	FileSize           int64                       `json:"file_size"`               // 初始字节大小
-	MtimeUnixNano      int64                       `json:"mtime_unix_nano"`         // 初始修改时间(纳秒)
+	Token              string                      `json:"token"`           // 22字符 base64url (128-bit)
+	FilePath           string                      `json:"file_path"`       // EvalSymlinks 后的绝对物理路径
+	FileName           string                      `json:"file_name"`       // 展示与下载文件名
+	DeviceID           uint64                      `json:"device_id"`       // stat.Dev
+	Inode              uint64                      `json:"inode"`           // stat.Ino
+	FileSize           int64                       `json:"file_size"`       // 初始字节大小
+	MtimeUnixNano      int64                       `json:"mtime_unix_nano"` // 初始修改时间(纳秒)
+	CtimeUnixNano      int64                       `json:"ctime_unix_nano"`
 	PasswordHash       string                      `json:"password_hash,omitempty"` // Argon2id 编码字符串，空表示无密码
 	CreatedAt          time.Time                   `json:"created_at"`
 	ExpiresAt          time.Time                   `json:"expires_at"`
-	MaxDownloads       int                         `json:"max_downloads"`       // 1 ~ 1000
+	MaxDownloads       int                         `json:"max_downloads"` // 1 ~ 1000
 	RemainingDownloads int                         `json:"remaining_downloads"`
-	Sessions           map[string]*DownloadSession `json:"sessions"`            // key: SessionID
+	Sessions           map[string]*DownloadSession `json:"sessions"` // key: SessionID
 
 	// 运行时非导出字段 (json:"-")
-	Mu          sync.Mutex   `json:"-"`
-	PinnedFile  *os.File     `json:"-"` // 常驻只读文件句柄
+	Mu          sync.Mutex    `json:"-"`
+	PinnedFile  *os.File      `json:"-"` // 常驻只读文件句柄
 	AuthSem     chan struct{} `json:"-"` // 容量为 2 的密码验证信号量，防 Argon2id CPU DoS
-	ActiveConns atomic.Int32 `json:"-"` // 当前活跃下载流计数
+	ActiveConns atomic.Int32  `json:"-"` // 当前活跃下载流计数
+	mutated     atomic.Bool
 }
 
 type DownloadSession struct {
-	SessionID   string       `json:"session_id"`   // 22字符 base64url (128-bit)
-	SubnetKey   string       `json:"subnet_key"`   // 绑定的客户端网段: IPv4为 /24, IPv6为 /64
+	SessionID   string       `json:"session_id"` // 22字符 base64url (128-bit)
+	SubnetKey   string       `json:"subnet_key"` // 绑定的客户端网段: IPv4为 /24, IPv6为 /64
 	CreatedAt   time.Time    `json:"created_at"`
-	ExpiresAt   time.Time    `json:"expires_at"`   // min(Now+2h, ShareEntry.ExpiresAt)
-	ActiveConns atomic.Int32 `json:"-"`            // 当前 Session 并发流计数 (上限 8)
+	ExpiresAt   time.Time    `json:"expires_at"` // min(Now+2h, ShareEntry.ExpiresAt)
+	ActiveConns atomic.Int32 `json:"-"`          // 当前 Session 并发流计数 (上限 8)
 }
 
 // InitRuntime initializes non-exported runtime primitives.
@@ -72,4 +74,14 @@ func (e *ShareEntry) Close() {
 		_ = e.PinnedFile.Close()
 		e.PinnedFile = nil
 	}
+}
+
+func (e *ShareEntry) FileMutated() bool {
+	return e.mutated.Load()
+}
+
+func (e *ShareEntry) Remaining() int {
+	e.Mu.Lock()
+	defer e.Mu.Unlock()
+	return e.RemainingDownloads
 }

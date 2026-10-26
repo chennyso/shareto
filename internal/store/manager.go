@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ type Manager struct {
 	globalActiveConns atomic.Int32
 	csrfSecret        []byte
 	saveMu            sync.Mutex
+	authSem           chan struct{}
 }
 
 // DefaultStatePath returns the path to state.json under $XDG_STATE_HOME.
@@ -42,6 +44,9 @@ func DefaultStatePath() string {
 
 // NewManager initializes the store manager, loads state and pins existing valid files.
 func NewManager(cfg *config.Config, customStatePath ...string) (*Manager, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	statePath := DefaultStatePath()
 	if len(customStatePath) > 0 && customStatePath[0] != "" {
 		statePath = customStatePath[0]
@@ -57,9 +62,15 @@ func NewManager(cfg *config.Config, customStatePath ...string) (*Manager, error)
 		cfg:           cfg,
 		stateFilePath: statePath,
 		csrfSecret:    secret,
+		authSem:       make(chan struct{}, cfg.MaxConcurrentAuth),
 	}
 
-	m.loadState()
+	if err := m.loadState(); err != nil {
+		for _, entry := range m.shares {
+			entry.Close()
+		}
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -72,20 +83,29 @@ func (m *Manager) GlobalActiveConns() int32 {
 }
 
 // loadState reads state.json and repins valid files.
-func (m *Manager) loadState() {
+func (m *Manager) loadState() error {
 	data, err := os.ReadFile(m.stateFilePath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read state: %w", err)
 	}
 
 	var state PersistentState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return
+		return fmt.Errorf("failed to decode state: %w", err)
+	}
+	if state.Version != 3 {
+		return fmt.Errorf("unsupported state version: %d", state.Version)
 	}
 
 	now := time.Now()
 	for token, entry := range state.Shares {
-		if now.After(entry.ExpiresAt) || entry.RemainingDownloads <= 0 {
+		if entry == nil || entry.Token != token || entry.RemainingDownloads < 0 || entry.RemainingDownloads > entry.MaxDownloads {
+			return fmt.Errorf("invalid persisted share")
+		}
+		if now.After(entry.ExpiresAt) {
 			continue
 		}
 
@@ -100,20 +120,30 @@ func (m *Manager) loadState() {
 			_ = f.Close()
 			continue
 		}
+		if entry.CtimeUnixNano != 0 && fileChangeTime(fi) != entry.CtimeUnixNano {
+			f.Close()
+			continue
+		}
+		entry.CtimeUnixNano = fileChangeTime(fi)
 
 		entry.InitRuntime(f)
 
 		// Filter out expired sessions
 		validSessions := make(map[string]*DownloadSession)
 		for sid, sess := range entry.Sessions {
-			if now.Before(sess.ExpiresAt) {
+			if sess != nil && now.Before(sess.ExpiresAt) {
 				validSessions[sid] = sess
 			}
 		}
 		entry.Sessions = validSessions
+		if entry.RemainingDownloads == 0 && len(validSessions) == 0 {
+			entry.Close()
+			continue
+		}
 
 		m.shares[token] = entry
 	}
+	return nil
 }
 
 func (m *Manager) snapshotState() *PersistentState {
@@ -144,6 +174,7 @@ func (m *Manager) snapshotState() *PersistentState {
 			Inode:              entry.Inode,
 			FileSize:           entry.FileSize,
 			MtimeUnixNano:      entry.MtimeUnixNano,
+			CtimeUnixNano:      entry.CtimeUnixNano,
 			PasswordHash:       entry.PasswordHash,
 			CreatedAt:          entry.CreatedAt,
 			ExpiresAt:          entry.ExpiresAt,
@@ -163,7 +194,10 @@ func (m *Manager) snapshotState() *PersistentState {
 func (m *Manager) SaveState() error {
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
+	return m.saveStateLocked()
+}
 
+func (m *Manager) saveStateLocked() error {
 	state := m.snapshotState()
 
 	dir := filepath.Dir(m.stateFilePath)
@@ -176,21 +210,40 @@ func (m *Manager) SaveState() error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", m.stateFilePath, os.Getpid(), time.Now().UnixNano())
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".state-*")
+	if err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
 	}
-
-	if err := os.Rename(tmpPath, m.stateFilePath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("failed to commit state file: %w", err)
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("failed to write state file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("failed to sync state file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close state file: %w", err)
 	}
 
+	if err := os.Rename(tmp.Name(), m.stateFilePath); err != nil {
+		return fmt.Errorf("failed to commit state file: %w", err)
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("failed to open state directory: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("failed to sync state directory: %w", err)
+	}
 	return nil
 }
 
 // CreateShare registers and pins a new file share.
 func (m *Manager) CreateShare(filePath string, expiresDuration time.Duration, maxDownloads int, passwordHash string) (*ShareEntry, error) {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	if maxDownloads < 1 || maxDownloads > 1000 {
 		return nil, fmt.Errorf("%w: max_downloads must be between 1 and 1000", ErrInvalidShareParams)
 	}
@@ -218,6 +271,7 @@ func (m *Manager) CreateShare(filePath string, expiresDuration time.Duration, ma
 		Inode:              ino,
 		FileSize:           fi.Size(),
 		MtimeUnixNano:      fi.ModTime().UnixNano(),
+		CtimeUnixNano:      fileChangeTime(fi),
 		PasswordHash:       passwordHash,
 		CreatedAt:          now,
 		ExpiresAt:          now.Add(expiresDuration),
@@ -236,9 +290,13 @@ func (m *Manager) CreateShare(filePath string, expiresDuration time.Duration, ma
 	m.shares[token] = entry
 	m.mu.Unlock()
 
-	go func() {
-		_ = m.SaveState()
-	}()
+	if err := m.saveStateLocked(); err != nil {
+		m.mu.Lock()
+		delete(m.shares, token)
+		m.mu.Unlock()
+		entry.Close()
+		return nil, err
+	}
 
 	return entry, nil
 }
@@ -254,7 +312,6 @@ func (m *Manager) GetShare(token string) (*ShareEntry, error) {
 	}
 
 	if time.Now().After(entry.ExpiresAt) {
-		m.RemoveShare(token)
 		return nil, ErrShareExpired
 	}
 
@@ -262,7 +319,9 @@ func (m *Manager) GetShare(token string) (*ShareEntry, error) {
 }
 
 // RemoveShare removes a share, closes file handle, and saves state.
-func (m *Manager) RemoveShare(token string) {
+func (m *Manager) RemoveShare(token string) error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	m.mu.Lock()
 	entry, exists := m.shares[token]
 	if exists {
@@ -272,14 +331,15 @@ func (m *Manager) RemoveShare(token string) {
 
 	if exists {
 		entry.Close()
-		go func() {
-			_ = m.SaveState()
-		}()
+		return m.saveStateLocked()
 	}
+	return nil
 }
 
 // RevokeShare revokes shares matching full token, token prefix (>= 6 chars), or real file path.
 func (m *Manager) RevokeShare(target string) ([]string, error) {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	m.mu.Lock()
 	var revoked []string
 	var toClose []*ShareEntry
@@ -307,7 +367,9 @@ func (m *Manager) RevokeShare(target string) ([]string, error) {
 	}
 
 	if len(revoked) > 0 {
-		_ = m.SaveState()
+		if err := m.saveStateLocked(); err != nil {
+			return revoked, err
+		}
 	}
 
 	return revoked, nil
@@ -330,24 +392,28 @@ func (m *Manager) ListShares() []*ShareEntry {
 
 // ClaimSession decrements 1 remaining download quota atomically and generates a session.
 func (m *Manager) ClaimSession(token string, clientIP net.IP) (*ShareEntry, *DownloadSession, error) {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	entry, err := m.GetShare(token)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	entry.Mu.Lock()
-	defer entry.Mu.Unlock()
 
 	if time.Now().After(entry.ExpiresAt) {
+		entry.Mu.Unlock()
 		return nil, nil, ErrShareExpired
 	}
 
 	if entry.RemainingDownloads <= 0 {
+		entry.Mu.Unlock()
 		return nil, nil, ErrDownloadExhausted
 	}
 
 	sessionID, err := crypto.GenerateToken()
 	if err != nil {
+		entry.Mu.Unlock()
 		return nil, nil, err
 	}
 
@@ -365,7 +431,12 @@ func (m *Manager) ClaimSession(token string, clientIP net.IP) (*ShareEntry, *Dow
 		ExpiresAt: sessionExpires,
 	}
 
-	// LRU eviction if sessions >= 128
+	previousSessions := entry.Sessions
+	entry.Sessions = make(map[string]*DownloadSession, len(previousSessions)+1)
+	for sid, existing := range previousSessions {
+		entry.Sessions[sid] = existing
+	}
+	// 保留正在传输的会话，删除最早创建的空闲会话。
 	if len(entry.Sessions) >= 128 {
 		var oldestKey string
 		var oldestTime time.Time
@@ -384,12 +455,38 @@ func (m *Manager) ClaimSession(token string, clientIP net.IP) (*ShareEntry, *Dow
 
 	entry.RemainingDownloads--
 	entry.Sessions[sessionID] = session
+	entry.Mu.Unlock()
 
-	go func() {
-		_ = m.SaveState()
-	}()
+	if err := m.saveStateLocked(); err != nil {
+		entry.Mu.Lock()
+		entry.RemainingDownloads++
+		entry.Sessions = previousSessions
+		entry.Mu.Unlock()
+		return nil, nil, err
+	}
 
 	return entry, session, nil
+}
+
+func (m *Manager) AcquireAuthSlots(entry *ShareEntry) (func(), error) {
+	select {
+	case m.authSem <- struct{}{}:
+	default:
+		return nil, ErrConcurrencyLimit
+	}
+	select {
+	case entry.AuthSem <- struct{}{}:
+	default:
+		<-m.authSem
+		return nil, ErrConcurrencyLimit
+	}
+	var released atomic.Bool
+	return func() {
+		if released.CompareAndSwap(false, true) {
+			<-entry.AuthSem
+			<-m.authSem
+		}
+	}, nil
 }
 
 // GetSession validates token, sessionID and subnet binding.
@@ -481,13 +578,17 @@ func (m *Manager) StartCleanupLoop(ctx context.Context, interval time.Duration) 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.cleanExpired()
+				if err := m.cleanExpired(); err != nil {
+					log.Printf("failed to persist expired share cleanup: %v", err)
+				}
 			}
 		}
 	}()
 }
 
-func (m *Manager) cleanExpired() {
+func (m *Manager) cleanExpired() error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	now := time.Now()
 	var toDelete []string
 	var toClose []*ShareEntry
@@ -522,6 +623,7 @@ func (m *Manager) cleanExpired() {
 	}
 
 	if len(toDelete) > 0 {
-		_ = m.SaveState()
+		return m.saveStateLocked()
 	}
+	return nil
 }

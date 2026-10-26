@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.23.2', stable]
+    env:
+      TMPDIR: ${{ github.workspace }}/work/tmp
+      GOTMPDIR: ${{ github.workspace }}/work/tmp
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ matrix.go }}
+      - run: mkdir -p work/tmp
+      - run: go test -race -count=1 ./internal/... ./cmd/...
+      - run: go vet ./internal/... ./cmd/...
+      - run: make build

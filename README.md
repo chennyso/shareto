@@ -14,19 +14,21 @@
 
 - 🔒 **文件句柄防篡改锁定**：
   - 采用系统调用级 `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` 打开文件，禁止跨目录符号链接穿透。
-  - 记录 `Dev`、`Inode`、`Mtime` 与 `FileSize` 四元组快照；若分享期间源文件被追加、截断或覆写，立即触发 `ErrFileMutated` 熔断清理并返回 `HTTP 410 Gone`。
+  - 记录 `Dev`、`Inode`、`Mtime`、`Ctime` 与 `FileSize`，在每次读取数据前后检查元数据。检测到修改时丢弃本次读取结果并撤销分享；尚未开始传输的请求返回 `HTTP 410 Gone`，正在传输的响应立即终止。
   - 通过 `io.SectionReader`（基于系统调用 `pread`）实现 100% 协程安全的并发 HTTP Range 断点续传与多线程分片下载。
 - 🛡️ **防爬虫误扣配额**：
   - 自动识别并拦截主流社交预览爬虫（微信、Telegram、Twitter/X、Slack、Discord、Facebook 等），防止聊天软件自动抓取卡片信息时偷跑一次性直链配额。
 - ⚡ **两阶段会话与原子配额控制**：
-  - **阶段一 (Landing/Direct)**：无消耗访问静态落地页，或通过 `?raw=1` 触发无密码直链跳转。
+  - **阶段一 (Landing/Direct)**：无消耗访问静态页面，或通过 `GET ?raw=1` 触发无密码直链跳转。`HEAD` 仅查询元数据。
   - **阶段二 (Claim)**：输入密码并校验 HMAC-SHA256 CSRF 令牌，原子扣减 1 次额度，签发 2 小时绑定的 `SessionID` 并 `303` 重定向。
   - **阶段三 (Download)**：客户端绑定网段校验（IPv4 `/24`，IPv6 `/64`），杜绝会话直链跨公网非法扩散。
 - 🚦 **多层级并发限制与反滥用**：
   - 三级并发槽位 CAS 控制（全局上限 64、单个分享上限 16、单个会话上限 8）。
-  - 固定容量 65536 条目的并发安全 LRU 限频器，单 IP/子网 5 次密码错误锁定 15 分钟，内存严格恒定 < 10MB。
+  - 固定容量 65536 条目的并发安全 LRU 限频器，同一分享下单 IP/子网 5 次密码错误锁定 15 分钟，正在验证的请求同时占用尝试次数。
+  - 全部 HTTP 连接默认上限 256，单个来源 IP 默认上限 32；可信代理共享全部连接上限。请求头和请求体的读取期限均为 5 秒。
   - 防慢速读取（Slow-Read）监控：15 秒滑动窗口最低速率检测（低于 16KB/s 强制断开释放连接槽位）。
-  - Argon2id 密码学哈希（带并发容量信号量防 CPU 耗尽 DoS）。
+  - Argon2id 每次使用 64 MiB 内存，全部分享默认最多同时验证两个密码，工作内存预算为 128 MiB；验证名额已满时返回 `503`。
+  - 创建分享、领取会话和撤销分享均等待状态文件同步、原子重命名及目录同步完成后返回成功。保存失败会向客户端返回错误，已在内存撤销的分享继续拒绝访问。
 - 🔌 **内核级安全的进程间通信 (IPC)**：
   - CLI 与后台守护进程通过 Unix Domain Socket 通信（权限 `0600`）。
   - 连接时通过系统调用 `SO_PEERCRED` 校验发起端 UID，确保仅允许当前系统用户调用。
@@ -226,7 +228,10 @@ shareto status
   "max_streams_per_token": 16,
   "max_streams_per_session": 8,
   "max_active_shares": 100,
-  "min_transfer_rate_kbps": 16
+  "min_transfer_rate_kbps": 16,
+  "max_connections": 256,
+  "max_connections_per_ip": 32,
+  "max_concurrent_auth": 2
 }
 ```
 
@@ -241,7 +246,12 @@ shareto status
 | `max_global_streams` | `64` | 全局允许的最大活跃下载并发连接流 |
 | `max_streams_per_token` | `16` | 单个分享链接允许的最大下载并发连接流 |
 | `max_streams_per_session` | `8` | 单个会话允许的最大并发连接流（多线程分片下载） |
+| `max_connections` | `256` | 全部 HTTP 连接数量上限，包括读取请求体和空闲连接 |
+| `max_connections_per_ip` | `32` | 单个来源 IPv4 地址或 IPv6 /64 网段的连接上限；可信代理使用全部连接上限 |
+| `max_concurrent_auth` | `2` | 全部分享的密码验证并发上限，范围 1 至 16，每个名额使用 64 MiB Argon2id 工作内存 |
 | `min_transfer_rate_kbps`| `16` | 最低传输速率阈值（KB/s），低于该速率超 15s 强制掐断 |
+
+连接配置必须满足 `1 <= max_connections_per_ip <= max_connections <= 65536`。已有配置缺少新增字段时使用默认值。状态文件新增 `ctime_unix_nano` 字段；读取已有版本 3 状态时，校验文件原有元数据后补充该字段。已耗尽领取额度且下载会话仍有效的分享会在重启后保留会话。
 
 ### 域名与 HTTPS 证书配置实战
 
