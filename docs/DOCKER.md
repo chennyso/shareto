@@ -1,6 +1,6 @@
 # Docker 安装与使用
 
-需要 Docker Engine 和 Docker Compose v2。MacBook 可以使用 Docker Desktop，并在部署前启动 Docker Desktop。
+需要 Docker Engine 和 Docker Compose 插件（v2 或更新版本）。MacBook 可以通过 Colima 在终端运行 Docker，安装步骤见下文“MacBook 终端安装”。
 镜像支持 Linux amd64 和 arm64；Apple Silicon 电脑使用 arm64 镜像。
 
 ## 构建并启动
@@ -13,6 +13,8 @@ cd shareto
 cp packaging/docker/config.example.json config.docker.json
 mkdir -p shared
 ```
+
+MacBook 使用 Colima 时，在此源码目录完成下文的终端安装并启动 Colima，再执行容器启动命令。
 
 将需要分享的文件放到 `shared` 目录。例如，将 `report.pdf` 放到 `shared/report.pdf`。
 
@@ -111,6 +113,38 @@ SHARETO_PORT=38081
 示例配置的 `trusted_proxies` 为空，不信任客户端自行提供的转发头。
 需要通过代理识别访问者地址时，将实际连接到 shareto 的代理地址或专用网段加入 `trusted_proxies`，并在代理中覆盖客户端传入的 `X-Forwarded-For`。
 
+## MacBook 终端安装
+
+进入已经下载的 shareto 源码目录，通过 Homebrew 安装运行环境与命令行工具：
+
+```bash
+brew install colima docker docker-compose docker-buildx
+mkdir -p "$HOME/.docker/cli-plugins"
+ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" "$HOME/.docker/cli-plugins/docker-compose"
+ln -sfn "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" "$HOME/.docker/cli-plugins/docker-buildx"
+colima start --cpus 4 --memory 4 --disk 20 --mount "$PWD" --ssh-config=false
+docker version
+docker compose version
+```
+
+Colima 创建并管理 Linux 虚拟机，启动后 Docker 命令会连接到 Colima。
+上面的配置提供 4 个 CPU、4 GiB 内存和 20 GiB 数据磁盘，并将当前源码目录挂载到虚拟机。
+宿主机源码目录中的配置和 `shared` 文件由虚拟机读取，分享记录写入虚拟机内的 Docker 数据卷。
+使用项目目录以外的待分享目录时，需要将对应目录也加入 Colima 的挂载配置。
+
+环境启动后，按照前文执行 `docker compose up -d --build --wait`，再使用分享命令。
+日常使用可以执行：
+
+```bash
+colima status
+colima stop
+colima start
+```
+
+`colima stop` 会停止虚拟机和其中的容器，重新启动时会沿用已经保存的配置和磁盘。
+
+构建时需要联网下载基础镜像和 Go 依赖。需要代理的网络环境，可以按照 [Docker 构建代理说明](https://docs.docker.com/engine/cli/proxy/) 配置 Docker CLI 的代理；代理地址需要能从 Colima 虚拟机中访问。
+
 ## 版本更新与镜像发布
 
 从源码更新并重新构建：
@@ -144,3 +178,5 @@ python3 packaging/docker/test.py
 
 测试会创建独立的 Compose 项目、随机端口和测试文件，验证健康检查、只读挂载、下载内容、Range 下载、密码、次数限制、撤销，以及容器重启和重建后的数据保留。
 测试完成后删除该测试项目的容器和数据卷，日志保存于 `work/docker-test-*/container.log`。
+
+2026 年 10 月 27 日，已在 Apple Silicon Mac（macOS 26.5.1）上使用 Colima 0.10.3、Docker Engine 29.5.2 和 Compose 5.6.1 完成上述完整容器测试。

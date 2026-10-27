@@ -76,7 +76,7 @@ sequenceDiagram
 
 ### Docker 部署
 
-需要 Docker 和 Docker Compose v2。在源码目录准备配置和待分享目录，然后启动：
+需要 Docker 和 Docker Compose 插件（v2 或更新版本）。在源码目录准备配置和待分享目录，然后启动：
 
 ```bash
 cp packaging/docker/config.example.json config.docker.json
